@@ -23,6 +23,11 @@ import org.apache.lucene.analysis.miscellaneous.RemoveDuplicatesTokenFilterFacto
 import org.apache.lucene.tests.analysis.BaseTokenStreamTestCase;
 import org.apache.lucene.util.ClasspathResourceLoader;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Arrays;
+import java.util.stream.Collectors;
+
 public class TestOpenNLPLemmatizerFilterFactory extends BaseTokenStreamTestCase {
 
   private static final String SENTENCE = "They sent him running in the evening.";
@@ -289,5 +294,54 @@ public class TestOpenNLPLemmatizerFilterFactory extends BaseTokenStreamTestCase 
         null,
         null,
         true);
+  }
+
+  private static final String NO_BREAK_SINGLE_TOKEN_REPEAT_KEYWORD = "period";
+
+  private static final String[] NO_BREAK_SINGLE_TOKEN_REPEAT_KEYWORD_terms = {"period", "period"};
+
+  public void testNoBreakWithRepeatKeywordFilter() throws Exception {
+    CustomAnalyzer analyzer =
+            CustomAnalyzer.builder(new ClasspathResourceLoader(getClass()))
+                    .withTokenizer(
+                            "opennlp", "tokenizerModel", tokenizerModelFile, "sentenceModel", sentenceModelFile)
+                    .addTokenFilter("opennlpPOS", "posTaggerModel", "en-test-pos-maxent.bin")
+                    .addTokenFilter(KeywordRepeatFilterFactory.class)
+                    .addTokenFilter("opennlplemmatizer", "dictionary", "en-test-lemmas.dict")
+                    .build();
+    assertAnalyzesTo(
+            analyzer,
+            NO_BREAK_SINGLE_TOKEN_REPEAT_KEYWORD,
+            NO_BREAK_SINGLE_TOKEN_REPEAT_KEYWORD_terms,
+            null,
+            null,
+            null,
+            null,
+            null,
+            true);
+  }
+
+  public void testPreventEarlyExit() throws IOException {
+    ClasspathResourceLoader loader = new ClasspathResourceLoader(getClass());
+    InputStream earlyExitInput = loader.openResource("data/early-exit-bug-input.txt");
+    String earlyExitInputText = new String(earlyExitInput.readAllBytes());
+
+    InputStream earlyExitOutput = loader.openResource("data/early-exit-bug-output.txt");
+    String earlyExitOutputText = new String(earlyExitOutput.readAllBytes());
+    String[] earlyExitOutputTexts =
+            Arrays.stream(earlyExitOutputText.split("\\s"))
+                    .filter(text -> text != "")
+                    .collect(Collectors.joining(" "))
+                    .split(" ");
+    CustomAnalyzer analyzer =
+            CustomAnalyzer.builder(new ClasspathResourceLoader(getClass()))
+                    .withTokenizer(
+                            "opennlp", "tokenizerModel", tokenizerModelFile, "sentenceModel", sentenceModelFile)
+                    .addTokenFilter("opennlpPOS", "posTaggerModel", "en-test-pos-maxent.bin")
+                    .addTokenFilter(KeywordRepeatFilterFactory.class)
+                    .addTokenFilter("opennlplemmatizer", "dictionary", "en-test-lemmas.dict")
+                    .build();
+    assertAnalyzesTo(
+            analyzer, earlyExitInputText, earlyExitOutputTexts, null, null, null, null, null, true);
   }
 }
