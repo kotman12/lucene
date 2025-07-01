@@ -18,7 +18,9 @@
 package org.apache.lucene.monitor;
 
 import java.io.IOException;
+import java.net.URISyntaxException;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collections;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -29,6 +31,10 @@ public class TestMonitorPersistence extends MonitorTestBase {
   private Path indexDirectory = createTempDir();
 
   protected Monitor newMonitorWithPersistence() throws IOException {
+    return newMonitorWithPersistence(indexDirectory);
+  }
+
+  protected Monitor newMonitorWithPersistence(Path indexDirectory) throws IOException {
     MonitorConfiguration config =
         new MonitorConfiguration()
             .setIndexPath(
@@ -84,6 +90,18 @@ public class TestMonitorPersistence extends MonitorTestBase {
   public void testGetQueryNotPresent() throws IOException {
     try (Monitor monitor = newMonitorWithPersistence()) {
       assertNull(monitor.getQuery("1"));
+    }
+  }
+
+  public void testQueryDisjunctsInCorrectOrderAcrossInstances()
+      throws IOException, URISyntaxException {
+    Document doc = new Document();
+    doc.add(newTextField(FIELD, "test", Field.Store.NO));
+
+    try (Monitor monitor =
+        newMonitorWithPersistence(
+            Paths.get(this.getClass().getResource("/backwardsCompat").toURI()))) {
+      assertEquals(1, monitor.match(doc, QueryMatch.SIMPLE_MATCHER).getMatchCount());
     }
   }
 
