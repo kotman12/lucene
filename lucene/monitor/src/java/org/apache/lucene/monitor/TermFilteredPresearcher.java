@@ -19,12 +19,14 @@ package org.apache.lucene.monitor;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiPredicate;
+import java.util.function.UnaryOperator;
 import org.apache.lucene.analysis.FilteringTokenFilter;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
@@ -58,6 +60,26 @@ import org.apache.lucene.util.BytesRefIterator;
  * <p>Filtering by additional fields can be configured by passing a set of field names. Documents
  * that contain values in those fields will only be checked against {@link MonitorQuery} instances
  * that have the same fieldname-value mapping in their metadata.
+ *
+ * <p>Negated clauses can optionally be used for filtering too, by passing a maximum number of
+ * NotSlots per query greater than 0. Negation is pushed down to the terms, and the negated terms of
+ * a conjunction form a NotSlot, which selects a query for documents containing none of them. For
+ * example, {@code *:* -flag:true} is then only selected for documents without {@code flag:true},
+ * rather than for every document. Notes:
+ *
+ * <ul>
+ *   <li>Negated clauses that cannot be pushed down exactly (phrases, ranges, wildcards, queries
+ *       with a minimum number of SHOULD clauses, and leaves claimed by {@link CustomQueryHandler}s
+ *       that do not implement {@link CustomQueryHandler#handleNegatedQuery}) select the query for
+ *       every document.
+ *   <li>In a batch, a term only excludes queries if every document in the batch contains it.
+ *   <li>NotSlots are indexed under the reserved fields {@code <field>__not}, {@code
+ *       <field>__not_<slot>} and {@code __notslot_<slot>} (with a pass number in multipass
+ *       presearchers), so field names containing {@code __not} should be avoided.
+ *   <li>Changing the setting requires re-indexing the queries.
+ *   <li>Subclasses that override {@link #getQueryBuilder()} must support NotSlots, see {@link
+ *       DocumentQueryBuilder#supportsNotSlots()}.
+ * </ul>
  */
 public class TermFilteredPresearcher extends Presearcher {
 
@@ -69,6 +91,11 @@ public class TermFilteredPresearcher extends Presearcher {
 
   private final Set<String> filterFields;
   private final List<CustomQueryHandler> queryHandlers = new ArrayList<>();
+  private final int maxNotSlots;
+
+  static final String NOT_SUFFIX = "__not";
+  static final String NOTSLOT_MARKER_FIELD = "__notslot";
+  static final BytesRef NOTSLOT_MARKER = new BytesRef("__T__");
 
   public static final String ANYTOKEN_FIELD = "__anytokenfield";
   public static final String ANYTOKEN = "__ANYTOKEN__";
@@ -90,16 +117,47 @@ public class TermFilteredPresearcher extends Presearcher {
       TermWeightor weightor,
       List<CustomQueryHandler> customQueryHandlers,
       Set<String> filterFields) {
-    this.extractor = new QueryAnalyzer(customQueryHandlers);
+    this(weightor, customQueryHandlers, filterFields, 0);
+  }
+
+  /**
+   * Creates a new TermFilteredPresearcher
+   *
+   * @param weightor the TermWeightor
+   * @param customQueryHandlers A list of custom query handlers to extract terms from non-core
+   *     queries
+   * @param filterFields A set of fields to filter on
+   * @param maxNotSlots the maximum number of NotSlots a query may use per pass; 0 disables
+   *     filtering on negated clauses
+   */
+  public TermFilteredPresearcher(
+      TermWeightor weightor,
+      List<CustomQueryHandler> customQueryHandlers,
+      Set<String> filterFields,
+      int maxNotSlots) {
+    if (maxNotSlots < 0) {
+      throw new IllegalArgumentException("maxNotSlots must be >= 0, got " + maxNotSlots);
+    }
+    this.extractor = new QueryAnalyzer(customQueryHandlers, maxNotSlots > 0);
     this.filterFields = filterFields;
     this.queryHandlers.addAll(customQueryHandlers);
     this.weightor = weightor;
+    this.maxNotSlots = maxNotSlots;
+  }
+
+  /** The maximum number of NotSlots a query may use per pass; 0 if negations are not used */
+  protected int maxNotSlots() {
+    return maxNotSlots;
   }
 
   @Override
   public final Query buildQuery(LeafReader reader, BiPredicate<String, BytesRef> termAcceptor) {
     try {
       DocumentQueryBuilder queryBuilder = getQueryBuilder();
+      if (maxNotSlots > 0 && !queryBuilder.supportsNotSlots()) {
+        throw new IllegalStateException(
+            "NotSlots are enabled, but the DocumentQueryBuilder does not support them");
+      }
       for (FieldInfo field : reader.getFieldInfos()) {
 
         Terms terms = reader.terms(field.name);
@@ -128,6 +186,10 @@ public class TermFilteredPresearcher extends Presearcher {
           queryBuilder.addTerm(field.name, BytesRef.deepCopyOf(termAtt.getBytesRef()));
         }
         ts.close();
+
+        if (maxNotSlots > 0 && !filterFields.contains(field.name)) {
+          addNegatableTerms(reader.maxDoc(), field.name, terms, termAcceptor, queryBuilder);
+        }
       }
       Query presearcherQuery = queryBuilder.build();
 
@@ -148,6 +210,27 @@ public class TermFilteredPresearcher extends Presearcher {
     } catch (IOException e) {
       // We're a MemoryIndex, so this shouldn't happen...
       throw new RuntimeException(e);
+    }
+  }
+
+  /**
+   * Passes the terms of {@code field} that every document in the batch contains to the query
+   * builder: only those can exclude a query through a NotSlot
+   */
+  private static void addNegatableTerms(
+      int maxDoc,
+      String field,
+      Terms terms,
+      BiPredicate<String, BytesRef> termAcceptor,
+      DocumentQueryBuilder queryBuilder)
+      throws IOException {
+    String notField = field + NOT_SUFFIX;
+    TermsEnum te = terms.iterator();
+    BytesRef term;
+    while ((term = te.next()) != null) {
+      if (te.docFreq() == maxDoc && termAcceptor.test(notField, term)) {
+        queryBuilder.addNegatableTerm(field, BytesRef.deepCopyOf(term));
+      }
     }
   }
 
@@ -203,6 +286,20 @@ public class TermFilteredPresearcher extends Presearcher {
     void addTerm(String field, BytesRef term) throws IOException;
 
     /**
+     * Whether this builder adds the NotSlot clauses to its query; required when the presearcher has
+     * NotSlots enabled
+     */
+    default boolean supportsNotSlots() {
+      return false;
+    }
+
+    /**
+     * Add a term that every document in the batch contains, and that can therefore exclude queries
+     * through a NotSlot. Only called if {@link #supportsNotSlots()} returns true.
+     */
+    default void addNegatableTerm(String field, BytesRef term) throws IOException {}
+
+    /**
      * @return the final Query
      */
     Query build();
@@ -213,6 +310,7 @@ public class TermFilteredPresearcher extends Presearcher {
     return new DocumentQueryBuilder() {
 
       Map<String, List<BytesRef>> terms = new HashMap<>();
+      Map<String, List<BytesRef>> negatableTerms = new HashMap<>();
 
       @Override
       public void addTerm(String field, BytesRef term) {
@@ -221,15 +319,66 @@ public class TermFilteredPresearcher extends Presearcher {
       }
 
       @Override
+      public boolean supportsNotSlots() {
+        return true;
+      }
+
+      @Override
+      public void addNegatableTerm(String field, BytesRef term) {
+        negatableTerms.computeIfAbsent(field, _ -> new ArrayList<>()).add(term);
+      }
+
+      @Override
       public Query build() {
-        BooleanQuery.Builder builder = new BooleanQuery.Builder();
-        for (Map.Entry<String, List<BytesRef>> entry : terms.entrySet()) {
-          builder.add(
-              new TermInSetQuery(entry.getKey(), entry.getValue()), BooleanClause.Occur.SHOULD);
-        }
-        return builder.build();
+        return buildPass(terms, negatableTerms, UnaryOperator.identity());
       }
     };
+  }
+
+  /**
+   * Builds the disjunction matching one pass of the indexed queries: any of the document's terms,
+   * or any NotSlot whose terms the document does not contain
+   *
+   * @param terms the document's terms, by field
+   * @param negatableTerms the terms every document in the batch contains, by field
+   * @param passField maps a field name to the name it is indexed under in this pass
+   */
+  Query buildPass(
+      Map<String, ? extends Collection<BytesRef>> terms,
+      Map<String, ? extends Collection<BytesRef>> negatableTerms,
+      UnaryOperator<String> passField) {
+    BooleanQuery.Builder builder = new BooleanQuery.Builder();
+    for (Map.Entry<String, ? extends Collection<BytesRef>> entry : terms.entrySet()) {
+      builder.add(
+          new TermInSetQuery(passField.apply(entry.getKey()), entry.getValue()),
+          BooleanClause.Occur.SHOULD);
+    }
+    for (int slot = 0; slot < maxNotSlots; slot++) {
+      BooleanQuery.Builder notSlot = new BooleanQuery.Builder();
+      notSlot.add(
+          new TermQuery(
+              new Term(
+                  notSlotMarkerField(passField.apply(NOTSLOT_MARKER_FIELD), slot), NOTSLOT_MARKER)),
+          BooleanClause.Occur.FILTER);
+      for (Map.Entry<String, ? extends Collection<BytesRef>> entry : negatableTerms.entrySet()) {
+        notSlot.add(
+            new TermInSetQuery(
+                notSlotField(passField.apply(entry.getKey()), slot), entry.getValue()),
+            BooleanClause.Occur.MUST_NOT);
+      }
+      builder.add(notSlot.build(), BooleanClause.Occur.SHOULD);
+    }
+    return builder.build();
+  }
+
+  /** The field that holds the terms of NotSlot {@code slot}, for a field named {@code field} */
+  static String notSlotField(String field, int slot) {
+    return field + NOT_SUFFIX + "_" + slot;
+  }
+
+  /** The marker field of NotSlot {@code slot} */
+  static String notSlotMarkerField(String markerField, int slot) {
+    return markerField + "_" + slot;
   }
 
   static final FieldType QUERYFIELDTYPE;
@@ -254,16 +403,84 @@ public class TermFilteredPresearcher extends Presearcher {
 
   /** Builds a {@link Document} from the terms extracted from a query */
   protected Document buildQueryDocument(QueryTree querytree) {
-    Map<String, BytesRefHash> fieldTerms = collectTerms(querytree);
     Document doc = new Document();
-    for (Map.Entry<String, BytesRefHash> entry : fieldTerms.entrySet()) {
-      doc.add(
-          new Field(
-              entry.getKey(),
-              new TermsEnumTokenStream(new BytesRefHashIterator(entry.getValue())),
-              QUERYFIELDTYPE));
-    }
+    addPass(doc, collectTermsAndNotSlots(querytree), UnaryOperator.identity());
     return doc;
+  }
+
+  /**
+   * Indexes the terms and NotSlots collected for one pass
+   *
+   * @param passField maps a field name to the name it is indexed under in this pass. Terms are also
+   *     indexed under the original name, for the term filter.
+   */
+  void addPass(Document doc, CollectedTerms collected, UnaryOperator<String> passField) {
+    for (Map.Entry<String, BytesRefHash> entry : collected.terms().entrySet()) {
+      String field = passField.apply(entry.getKey());
+      addField(doc, field, entry.getValue());
+      if (!field.equals(entry.getKey())) {
+        addField(doc, entry.getKey(), entry.getValue());
+      }
+    }
+    List<Set<Term>> notSlots = collected.notSlots();
+    if (notSlots.size() > maxNotSlots) {
+      // More NotSlots than the document side checks: the marker alone satisfies the pass for
+      // every document
+      addField(doc, notSlotMarkerField(passField.apply(NOTSLOT_MARKER_FIELD), 0), NOTSLOT_MARKER);
+      return;
+    }
+    for (int slot = 0; slot < notSlots.size(); slot++) {
+      Map<String, BytesRefHash> byField = new HashMap<>();
+      for (Term term : notSlots.get(slot)) {
+        byField.computeIfAbsent(term.field(), _ -> new BytesRefHash()).add(term.bytes());
+      }
+      for (Map.Entry<String, BytesRefHash> entry : byField.entrySet()) {
+        addField(doc, notSlotField(passField.apply(entry.getKey()), slot), entry.getValue());
+        addField(doc, entry.getKey() + NOT_SUFFIX, entry.getValue());
+      }
+      addField(
+          doc, notSlotMarkerField(passField.apply(NOTSLOT_MARKER_FIELD), slot), NOTSLOT_MARKER);
+    }
+  }
+
+  private void addField(Document doc, String field, BytesRef term) {
+    BytesRefHash terms = new BytesRefHash();
+    terms.add(term);
+    addField(doc, field, terms);
+  }
+
+  private void addField(Document doc, String field, BytesRefHash terms) {
+    doc.add(
+        new Field(
+            field, new TermsEnumTokenStream(new BytesRefHashIterator(terms)), QUERYFIELDTYPE));
+  }
+
+  /** The terms and NotSlots collected from one path through a {@link QueryTree} */
+  record CollectedTerms(Map<String, BytesRefHash> terms, List<Set<Term>> notSlots) {}
+
+  /**
+   * Collects the terms and NotSlots of the current path through a {@link QueryTree}. With NotSlots
+   * disabled, this is {@link #collectTerms(QueryTree)}.
+   */
+  CollectedTerms collectTermsAndNotSlots(QueryTree querytree) {
+    if (maxNotSlots == 0) {
+      return new CollectedTerms(collectTerms(querytree), List.of());
+    }
+    Map<String, BytesRefHash> fieldTerms = new HashMap<>();
+    List<Set<Term>> notSlots = new ArrayList<>();
+    querytree.collectTerms(
+        new QueryTree.TermCollector() {
+          @Override
+          public void accept(String field, BytesRef term) {
+            fieldTerms.computeIfAbsent(field, _ -> new BytesRefHash()).add(term);
+          }
+
+          @Override
+          public void notSlot(Set<Term> terms) {
+            notSlots.add(terms);
+          }
+        });
+    return new CollectedTerms(fieldTerms, notSlots);
   }
 
   /** Collects terms from a {@link QueryTree} and maps them per-field */

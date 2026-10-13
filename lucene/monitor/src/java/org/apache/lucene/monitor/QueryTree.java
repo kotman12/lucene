@@ -19,9 +19,13 @@ package org.apache.lucene.monitor;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import org.apache.lucene.index.Term;
@@ -43,6 +47,31 @@ public abstract class QueryTree {
 
   /** Collect terms from the most highly-weighted path below this node */
   public abstract void collectTerms(BiConsumer<String, BytesRef> termCollector);
+
+  /**
+   * Collect terms and NotSlots from the most highly-weighted path below this node
+   *
+   * <p>The default implementation collects terms only, through {@link #collectTerms(BiConsumer)}.
+   * Nodes that contain NotSlots override it.
+   */
+  public void collectTerms(TermCollector termCollector) {
+    collectTerms((BiConsumer<String, BytesRef>) termCollector);
+  }
+
+  /** Receives the terms of the most highly-weighted path, including NotSlots */
+  public interface TermCollector extends BiConsumer<String, BytesRef> {
+
+    /**
+     * The current path is also satisfied by a document containing none of {@code terms}
+     *
+     * <p>The default collects the ANYTOKEN, so that collectors that do not support NotSlots select
+     * the query for every document.
+     */
+    default void notSlot(Set<Term> terms) {
+      accept(
+          TermFilteredPresearcher.ANYTOKEN_FIELD, new BytesRef(TermFilteredPresearcher.ANYTOKEN));
+    }
+  }
 
   /**
    * Find the next-most highly-weighted path below this node
@@ -141,6 +170,65 @@ public abstract class QueryTree {
     };
   }
 
+  /**
+   * Returns a NotSlot leaf, satisfied by documents that contain none of {@code terms}, weighted by
+   * the strongest of their {@link TermWeightor#applyNegatedAsDouble(Term) negated weights}
+   */
+  public static QueryTree notSlot(Set<Term> terms, TermWeightor weightor) {
+    // If the terms occurred independently, the weight could be the sum of the negated weights
+    // (-ln of the probability that a document contains none of them). Correlated terms, such as
+    // system flags that tend to appear together, would make the sum an overestimate. The max is
+    // the cautious choice: P(contains any) >= max P(contains t), so it is a lower bound on the
+    // true weight whatever the correlation, and exact when the terms always co-occur.
+    double weight = 0;
+    for (Term term : terms) {
+      weight = Math.max(weight, weightor.applyNegatedAsDouble(term));
+    }
+    return notSlot(terms, weight);
+  }
+
+  /**
+   * Returns a NotSlot leaf, satisfied by documents that contain none of {@code terms}
+   *
+   * <p>The weight must be greater than 0
+   */
+  public static QueryTree notSlot(Set<Term> terms, double weight) {
+    if (terms.isEmpty()) {
+      throw new IllegalArgumentException("A NotSlot must have at least one term");
+    }
+    SortedSet<Term> sorted = Collections.unmodifiableSortedSet(new TreeSet<>(terms));
+    return new QueryTree() {
+      @Override
+      public double weight() {
+        if (weight <= 0) {
+          throw new IllegalArgumentException("NotSlot weights must be greater than 0");
+        }
+        return weight;
+      }
+
+      @Override
+      public void collectTerms(BiConsumer<String, BytesRef> termCollector) {
+        termCollector.accept(
+            TermFilteredPresearcher.ANYTOKEN_FIELD, new BytesRef(TermFilteredPresearcher.ANYTOKEN));
+      }
+
+      @Override
+      public void collectTerms(TermCollector termCollector) {
+        termCollector.notSlot(sorted);
+      }
+
+      @Override
+      public boolean advancePhase(double minWeight) {
+        return false;
+      }
+
+      @Override
+      public String toString(int depth) {
+        return space(depth) + "NotSlot" + sorted + "^" + weight;
+      }
+    };
+  }
+
   /** Returns a conjunction of a set of child nodes */
   public static QueryTree conjunction(
       List<Function<TermWeightor, QueryTree>> children, TermWeightor weightor) {
@@ -204,6 +292,11 @@ public abstract class QueryTree {
     }
 
     @Override
+    public void collectTerms(TermCollector termCollector) {
+      children.get(0).collectTerms(termCollector);
+    }
+
+    @Override
     public boolean advancePhase(double minWeight) {
       if (children.get(0).advancePhase(minWeight)) {
         this.children.sort(COMPARATOR);
@@ -251,6 +344,13 @@ public abstract class QueryTree {
 
     @Override
     public void collectTerms(BiConsumer<String, BytesRef> termCollector) {
+      for (QueryTree child : children) {
+        child.collectTerms(termCollector);
+      }
+    }
+
+    @Override
+    public void collectTerms(TermCollector termCollector) {
       for (QueryTree child : children) {
         child.collectTerms(termCollector);
       }

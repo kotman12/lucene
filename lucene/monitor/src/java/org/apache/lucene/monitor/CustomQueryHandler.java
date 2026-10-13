@@ -31,6 +31,21 @@ public interface CustomQueryHandler {
   /** Builds a {@link QueryTree} node from a query */
   QueryTree handleQuery(Query query, TermWeightor termWeightor);
 
+  /**
+   * Builds a {@link QueryTree} node for NOT {@code query}, used when the presearcher optimizes
+   * negations
+   *
+   * <p>The node must select every document that does not match {@code query}; for example a {@link
+   * QueryTree#notSlot(java.util.Set, TermWeightor) NotSlot} over the terms of a query that matches
+   * exactly the documents containing any of them. Return null if that cannot be guaranteed; the
+   * negated query is then selected for every document. The node returned by {@link
+   * #handleQuery(Query, TermWeightor)} is not used under negation, as it may select more documents
+   * than the query matches.
+   */
+  default QueryTree handleNegatedQuery(Query query, TermWeightor termWeightor) {
+    return null;
+  }
+
   /** Adds additional processing to the {@link TokenStream} over a document's terms index */
   default TokenStream wrapTermStream(String field, TokenStream in) {
     return in;

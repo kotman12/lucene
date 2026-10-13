@@ -17,6 +17,7 @@
 
 package org.apache.lucene.monitor;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -24,11 +25,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefHash;
 
@@ -72,7 +71,28 @@ public class MultipassTermFilteredPresearcher extends TermFilteredPresearcher {
       TermWeightor weightor,
       List<CustomQueryHandler> queryHandlers,
       Set<String> filterFields) {
-    super(weightor, queryHandlers, filterFields);
+    this(passes, minWeight, weightor, queryHandlers, filterFields, 0);
+  }
+
+  /**
+   * Construct a new MultipassTermFilteredPresearcher that also filters on negated clauses
+   *
+   * @param passes the number of times a query should be indexed
+   * @param minWeight the minimum weight a querytree should be advanced over
+   * @param weightor the TreeWeightor to use
+   * @param queryHandlers a list of custom query handlers
+   * @param filterFields a set of fields to use as filters
+   * @param maxNotSlots the maximum number of NotSlots a query may use per pass; 0 disables
+   *     filtering on negated clauses. See {@link TermFilteredPresearcher}.
+   */
+  public MultipassTermFilteredPresearcher(
+      int passes,
+      float minWeight,
+      TermWeightor weightor,
+      List<CustomQueryHandler> queryHandlers,
+      Set<String> filterFields,
+      int maxNotSlots) {
+    super(weightor, queryHandlers, filterFields, maxNotSlots);
     this.passes = passes;
     this.minWeight = minWeight;
   }
@@ -100,14 +120,8 @@ public class MultipassTermFilteredPresearcher extends TermFilteredPresearcher {
 
   private class MultipassDocumentQueryBuilder implements DocumentQueryBuilder {
 
-    BooleanQuery.Builder[] queries = new BooleanQuery.Builder[passes];
     Map<String, BytesRefHash> terms = new HashMap<>();
-
-    MultipassDocumentQueryBuilder() {
-      for (int i = 0; i < queries.length; i++) {
-        queries[i] = new BooleanQuery.Builder();
-      }
-    }
+    Map<String, List<BytesRef>> negatableTerms = new HashMap<>();
 
     @Override
     public void addTerm(String field, BytesRef term) {
@@ -116,20 +130,27 @@ public class MultipassTermFilteredPresearcher extends TermFilteredPresearcher {
     }
 
     @Override
+    public boolean supportsNotSlots() {
+      return true;
+    }
+
+    @Override
+    public void addNegatableTerm(String field, BytesRef term) {
+      negatableTerms.computeIfAbsent(field, _ -> new ArrayList<>()).add(term);
+    }
+
+    @Override
     public Query build() {
-      Map<String, BytesRef[]> collectedTerms = new HashMap<>();
+      Map<String, List<BytesRef>> collectedTerms = new HashMap<>();
       for (Map.Entry<String, BytesRefHash> entry : terms.entrySet()) {
-        collectedTerms.put(entry.getKey(), convertHash(entry.getValue()));
+        collectedTerms.put(entry.getKey(), Arrays.asList(convertHash(entry.getValue())));
       }
       BooleanQuery.Builder parent = new BooleanQuery.Builder();
       for (int i = 0; i < passes; i++) {
-        BooleanQuery.Builder child = new BooleanQuery.Builder();
-        for (String field : terms.keySet()) {
-          child.add(
-              new TermInSetQuery(field(field, i), Arrays.asList(collectedTerms.get(field))),
-              BooleanClause.Occur.SHOULD);
-        }
-        parent.add(child.build(), BooleanClause.Occur.MUST);
+        int pass = i;
+        parent.add(
+            buildPass(collectedTerms, negatableTerms, f -> field(f, pass)),
+            BooleanClause.Occur.MUST);
       }
       return parent.build();
     }
@@ -141,21 +162,10 @@ public class MultipassTermFilteredPresearcher extends TermFilteredPresearcher {
     Document doc = new Document();
 
     for (int i = 0; i < passes; i++) {
-      Map<String, BytesRefHash> fieldTerms = collectTerms(querytree);
-      for (Map.Entry<String, BytesRefHash> entry : fieldTerms.entrySet()) {
-        // we add the index terms once under a suffixed field for the multipass query, and
-        // once under the plan field name for the TermsEnumTokenFilter
-        doc.add(
-            new Field(
-                field(entry.getKey(), i),
-                new TermsEnumTokenStream(new BytesRefHashIterator(entry.getValue())),
-                QUERYFIELDTYPE));
-        doc.add(
-            new Field(
-                entry.getKey(),
-                new TermsEnumTokenStream(new BytesRefHashIterator(entry.getValue())),
-                QUERYFIELDTYPE));
-      }
+      int pass = i;
+      // we add the index terms once under a suffixed field for the multipass query, and
+      // once under the plan field name for the TermsEnumTokenFilter
+      addPass(doc, collectTermsAndNotSlots(querytree), f -> field(f, pass));
       querytree.advancePhase(minWeight);
     }
 

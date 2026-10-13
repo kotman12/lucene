@@ -17,12 +17,19 @@
 
 package org.apache.lucene.monitor;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.BytesRef;
 
@@ -172,5 +179,171 @@ public class TestQueryAnalyzer extends LuceneTestCase {
                 new Term("field", "term5")));
     assertEquals(expected, collectTerms(tree));
     assertFalse(tree.advancePhase(0.1f));
+  }
+
+  // NotSlots (negation optimized)
+
+  private static final QueryAnalyzer notSlotAnalyzer = new QueryAnalyzer(List.of(), true);
+
+  private static Term t(String text) {
+    return new Term("field", text);
+  }
+
+  private static final Set<Term> ANY =
+      Set.of(new Term(TermFilteredPresearcher.ANYTOKEN_FIELD, TermFilteredPresearcher.ANYTOKEN));
+
+  /** The terms and NotSlots of the current path */
+  private record Pass(Set<Term> terms, List<Set<Term>> notSlots) {}
+
+  private static Pass collect(QueryTree tree) {
+    Set<Term> terms = new HashSet<>();
+    List<Set<Term>> notSlots = new ArrayList<>();
+    tree.collectTerms(
+        new QueryTree.TermCollector() {
+          @Override
+          public void accept(String field, BytesRef term) {
+            terms.add(new Term(field, BytesRef.deepCopyOf(term)));
+          }
+
+          @Override
+          public void notSlot(Set<Term> slotTerms) {
+            notSlots.add(slotTerms);
+          }
+        });
+    return new Pass(terms, notSlots);
+  }
+
+  private static QueryTree notSlotTree(Query query) {
+    return notSlotAnalyzer.buildTree(query, TermWeightor.DEFAULT);
+  }
+
+  private static Pass notSlotPass(String query) {
+    return collect(notSlotTree(MonitorTestBase.parse(query)));
+  }
+
+  public void testNegatedTermBecomesANotSlotAfterThePositives() {
+    QueryTree tree = notSlotTree(MonitorTestBase.parse("+a -b"));
+    assertEquals(new Pass(Set.of(t("a")), List.of()), collect(tree));
+    assertTrue(tree.advancePhase(0));
+    assertEquals(new Pass(Set.of(), List.of(Set.of(t("b")))), collect(tree));
+    assertFalse(tree.advancePhase(0));
+  }
+
+  public void testNegatedTermsOfAConjunctionShareANotSlot() {
+    assertEquals(new Pass(Set.of(), List.of(Set.of(t("b"), t("c")))), notSlotPass("*:* -b -c"));
+    assertEquals(new Pass(Set.of(), List.of(Set.of(t("b"), t("c")))), notSlotPass("-b -c"));
+    // De Morgan: NOT(b OR c) = NOT b AND NOT c
+    assertEquals(new Pass(Set.of(), List.of(Set.of(t("b"), t("c")))), notSlotPass("*:* -(b c)"));
+  }
+
+  public void testNegatedConjunctionIsADisjunctionOfNotSlots() {
+    Pass pass = notSlotPass("*:* -(+b +c)");
+    assertEquals(Set.of(), pass.terms());
+    assertEquals(Set.of(Set.of(t("b")), Set.of(t("c"))), new HashSet<>(pass.notSlots()));
+  }
+
+  public void testDoubleNegationIsPositive() {
+    // NOT(a AND NOT b) = NOT a OR b
+    assertEquals(new Pass(Set.of(t("b")), List.of(Set.of(t("a")))), notSlotPass("*:* -(+a -b)"));
+  }
+
+  public void testInexactNegationsAreAny() {
+    for (String query :
+        new String[] {
+          "*:* -\"a b\"", "*:* -b*", "*:* -field:[a TO c]", "*:* -/ab.*/", "*:* -(-b)"
+        }) {
+      assertEquals(query, new Pass(ANY, List.of()), notSlotPass(query));
+    }
+    BooleanQuery msm =
+        new BooleanQuery.Builder()
+            .add(new TermQuery(t("b")), BooleanClause.Occur.SHOULD)
+            .add(new TermQuery(t("c")), BooleanClause.Occur.SHOULD)
+            .setMinimumNumberShouldMatch(1)
+            .build();
+    Query query =
+        new BooleanQuery.Builder()
+            .add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
+            .add(msm, BooleanClause.Occur.MUST_NOT)
+            .build();
+    assertEquals(new Pass(ANY, List.of()), collect(notSlotTree(query)));
+
+    // a query that passes its terms straight to the visitor, but needs all of them to match
+    Query allTerms =
+        new Query() {
+          @Override
+          public void visit(QueryVisitor visitor) {
+            visitor.consumeTerms(this, t("b"), t("c"));
+          }
+
+          @Override
+          public String toString(String field) {
+            return "allTerms";
+          }
+
+          @Override
+          public boolean equals(Object obj) {
+            return obj == this;
+          }
+
+          @Override
+          public int hashCode() {
+            return System.identityHashCode(this);
+          }
+        };
+    query =
+        new BooleanQuery.Builder()
+            .add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
+            .add(allTerms, BooleanClause.Occur.MUST_NOT)
+            .build();
+    assertEquals(new Pass(ANY, List.of()), collect(notSlotTree(query)));
+  }
+
+  public void testNegationOffIgnoresNegatedClauses() {
+    QueryAnalyzer off = new QueryAnalyzer(List.of(), false);
+    assertEquals(
+        new Pass(Set.of(t("a")), List.of()),
+        collect(off.buildTree(MonitorTestBase.parse("+a -b"), TermWeightor.DEFAULT)));
+    assertEquals(
+        new Pass(ANY, List.of()),
+        collect(off.buildTree(MonitorTestBase.parse("-b"), TermWeightor.DEFAULT)));
+  }
+
+  public void testCustomQueryHandlersUnderNegation() {
+    Query query =
+        new BooleanQuery.Builder()
+            .add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
+            .add(new OpaqueTermsQuery(Set.of(t("x"), t("y"))), BooleanClause.Occur.MUST_NOT)
+            .build();
+
+    // the handler's positive tree is never negated
+    QueryAnalyzer notNegatable =
+        new QueryAnalyzer(List.of(new OpaqueTermsQuery.Handler(false)), true);
+    assertEquals(
+        new Pass(ANY, List.of()), collect(notNegatable.buildTree(query, TermWeightor.DEFAULT)));
+
+    QueryAnalyzer negatable =
+        new QueryAnalyzer(
+            List.of(new OpaqueTermsQuery.Handler(false), new OpaqueTermsQuery.Handler(true)), true);
+    assertEquals(
+        new Pass(Set.of(), List.of(Set.of(t("x"), t("y")))),
+        collect(negatable.buildTree(query, TermWeightor.DEFAULT)));
+
+    // with negation off, handleNegatedQuery is never called
+    CustomQueryHandler throwing =
+        new CustomQueryHandler() {
+          @Override
+          public QueryTree handleQuery(Query q, TermWeightor w) {
+            return null;
+          }
+
+          @Override
+          public QueryTree handleNegatedQuery(Query q, TermWeightor w) {
+            throw new AssertionError("called with negation off");
+          }
+        };
+    QueryAnalyzer off = new QueryAnalyzer(List.of(throwing), false);
+    assertEquals(
+        new Pass(ANY, List.of()),
+        collect(off.buildTree(MonitorTestBase.parse("*:* -/ab.*/"), TermWeightor.DEFAULT)));
   }
 }
