@@ -75,7 +75,8 @@ import org.apache.lucene.util.BytesRefIterator;
  *   <li>In a batch, a term only excludes queries if every document in the batch contains it.
  *   <li>NotSlots are indexed under the reserved fields {@code <field>__not}, {@code
  *       <field>__not_<slot>} and {@code __notslot_<slot>} (with a pass number in multipass
- *       presearchers), so field names containing {@code __not} should be avoided.
+ *       presearchers). Queries with terms on fields whose names contain {@code __not} are therefore
+ *       selected for every document.
  *   <li>Changing the setting requires re-indexing the queries.
  *   <li>Subclasses that override {@link #getQueryBuilder()} must support NotSlots, see {@link
  *       DocumentQueryBuilder#supportsNotSlots()}.
@@ -416,6 +417,12 @@ public class TermFilteredPresearcher extends Presearcher {
    */
   void addPass(Document doc, CollectedTerms collected, UnaryOperator<String> passField) {
     for (Map.Entry<String, BytesRefHash> entry : collected.terms().entrySet()) {
+      if (maxNotSlots > 0 && entry.getKey().contains(NOT_SUFFIX)) {
+        // The field could be indexed under the name of a NotSlot field, whose clauses exclude
+        // queries, so select the query for every document instead
+        addField(doc, ANYTOKEN_FIELD, new BytesRef(ANYTOKEN));
+        continue;
+      }
       String field = passField.apply(entry.getKey());
       addField(doc, field, entry.getValue());
       if (!field.equals(entry.getKey())) {

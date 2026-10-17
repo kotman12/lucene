@@ -19,16 +19,28 @@ package org.apache.lucene.monitor;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.function.Supplier;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.TermInSetQuery;
+import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.automaton.ByteRunnable;
 
 /** Presearcher tests with NotSlots enabled, in addition to all of {@link PresearcherTestBase} */
 public abstract class NotSlotPresearcherTestBase extends PresearcherTestBase {
@@ -154,5 +166,87 @@ public abstract class NotSlotPresearcherTestBase extends PresearcherTestBase {
 
     Presearcher notNegatable = createPresearcher(1, List.of(new OpaqueTermsQuery.Handler(false)));
     assertRunAndMatched(1, 0, run(notNegatable, query, doc("f", "y")));
+  }
+
+  public void testFieldsNamedLikeNotSlotFieldsAreSafe() throws IOException {
+    // A query with a positive term on a user field named like NotSlot 0 of field x (single pass,
+    // and pass 0 of a multipass presearcher) must not be excluded by the document's x:t. The
+    // helper query puts x:t in the term filter, so that the document's x:t can exclude queries.
+    // If the NotSlot field naming changes, the guard in TermFilteredPresearcher.addPass must still
+    // cover it; testNotSlotFieldNamesAreGuarded checks that.
+    for (String field :
+        new String[] {
+          TermFilteredPresearcher.notSlotField("x", 0),
+          TermFilteredPresearcher.notSlotField("x_0", 0)
+        }) {
+      try (Monitor monitor = newMonitor()) {
+        monitor.register(
+            new MonitorQuery("target", undecomposed(field + ":t (*:* -y:z)")),
+            new MonitorQuery("helper", parse("*:* -x:t")));
+        MatchingQueries<QueryMatch> matches =
+            monitor.match(doc("x", "t"), QueryMatch.SIMPLE_MATCHER);
+        assertNotNull(field, matches.matches("target"));
+        assertEquals(field, 1, matches.getQueriesRun());
+      }
+    }
+  }
+
+  /** The terms of the document-side MUST_NOT clauses, by field */
+  private static Map<String, Set<String>> negatedDocumentTerms(Query query) {
+    Map<String, Set<String>> terms = new TreeMap<>();
+    collectNegated(query, false, terms);
+    return terms;
+  }
+
+  private static void collectNegated(Query query, boolean negated, Map<String, Set<String>> out) {
+    if (query instanceof BooleanQuery bq) {
+      for (BooleanClause clause : bq.clauses()) {
+        collectNegated(clause.query(), clause.occur() == BooleanClause.Occur.MUST_NOT, out);
+      }
+    } else if (negated && query instanceof TermInSetQuery tisq) {
+      tisq.visit(
+          new QueryVisitor() {
+            @Override
+            public void consumeTerms(Query q, Term... ts) {
+              for (Term t : ts) {
+                out.computeIfAbsent(t.field(), _ -> new TreeSet<>()).add(t.text());
+              }
+            }
+
+            @Override
+            public void consumeTermsMatching(
+                Query q, String field, Supplier<ByteRunnable> automaton) {
+              out.computeIfAbsent(field, _ -> new TreeSet<>()).add(tisq.getTermsCount() + " terms");
+            }
+          });
+    }
+  }
+
+  public void testTermFilterAppliesToNegatedDocumentTerms() throws IOException {
+    Presearcher presearcher = createPresearcher();
+    Directory dir = new ByteBuffersDirectory();
+    try (IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig(WHITESPACE))) {
+      writer.addDocument(presearcher.indexQuery(parse("*:* -f:t"), Map.of()));
+      writer.addDocument(presearcher.indexQuery(parse("+g:x -f:u -h:v"), Map.of()));
+    }
+    StringBuilder text = new StringBuilder("t");
+    for (int i = 0; i < 1000; i++) {
+      text.append(" w").append(i);
+    }
+    Document doc = doc("f", text.toString(), "g", "x y", "h", "w1");
+    try (DirectoryReader reader = DirectoryReader.open(dir);
+        DocumentBatch batch = DocumentBatch.of(WHITESPACE, doc)) {
+      Query documentQuery =
+          presearcher.buildQuery(batch.get(), new QueryIndex.QueryTermFilter(reader));
+      // Of the document's 1,000+ terms, only f:t is negated by a query: u and v are not in the
+      // document, and no query negates the others
+      Map<String, Set<String>> negated = negatedDocumentTerms(documentQuery);
+      assertFalse(negated.toString(), negated.isEmpty());
+      for (Map.Entry<String, Set<String>> e : negated.entrySet()) {
+        assertTrue(e.toString(), e.getKey().startsWith("f_") || e.getKey().startsWith("f__not_"));
+        assertEquals(e.toString(), Set.of("t"), e.getValue());
+      }
+    }
+    dir.close();
   }
 }

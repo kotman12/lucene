@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeSet;
@@ -28,6 +29,7 @@ import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
@@ -44,96 +46,170 @@ import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermRangeQuery;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BytesRef;
 
 /**
  * Random queries and documents: presearchers with NotSlots must never drop a query that matches,
- * compared to a Monitor that runs every query
+ * compared to a Monitor that runs every query, and must exclude some queries that a presearcher
+ * without NotSlots selects.
+ *
+ * <p>Each iteration draws a test configuration: few or many fields, a small or large vocabulary
+ * with a skewed distribution, and few or many values per field. Batches have 1 to {@value
+ * #MAX_BATCH_SIZE} documents. Field names that collide with the presearcher's reserved fields are
+ * covered by {@link NotSlotPresearcherTestBase#testFieldsNamedLikeNotSlotFieldsAreSafe}.
  */
 public class TestNotSlotRandomized extends LuceneTestCase {
 
-  private static final String[] FIELDS = {"f0", "f1", "f2"};
-  private static final String[] VALUES = {"a", "b", "c", "d", "e"};
   private static final Analyzer ANALYZER = new WhitespaceAnalyzer();
+  private static final int MAX_BATCH_SIZE = 16;
 
-  private static String field(Random r) {
-    return FIELDS[r.nextInt(FIELDS.length)];
+  /** The fields, vocabulary size and document shapes of one iteration */
+  private record TestConfig(
+      List<String> stringFields,
+      List<String> textFields,
+      int vocabularySize,
+      int maxValues,
+      double fieldProbability) {
+
+    List<String> allFields() {
+      List<String> all = new ArrayList<>(stringFields);
+      all.addAll(textFields);
+      return all;
+    }
+
+    String field(Random r) {
+      List<String> all = allFields();
+      return all.get(r.nextInt(all.size()));
+    }
+
+    /** Skewed towards low indexes, so that some values are common */
+    String value(Random r) {
+      double u = r.nextDouble();
+      return "v" + (int) (vocabularySize * u * u * u);
+    }
+
+    @Override
+    public String toString() {
+      return "fields="
+          + stringFields.size()
+          + "+"
+          + textFields.size()
+          + " vocabularySize="
+          + vocabularySize
+          + " maxValues="
+          + maxValues
+          + " fieldProbability="
+          + String.format(java.util.Locale.ROOT, "%.2f", fieldProbability);
+    }
   }
 
-  private static String value(Random r) {
-    return VALUES[r.nextInt(VALUES.length)];
+  private static TestConfig randomTestConfig(Random r) {
+    // Few fields: documents and queries share fields, so negated terms often exclude. Many fields:
+    // most query terms are on fields a document lacks, and the term filter rejects most terms.
+    List<String> stringFields = new ArrayList<>();
+    List<String> textFields = new ArrayList<>();
+    int fieldCount = TestUtil.nextInt(r, 3, 40);
+    for (int i = 0; i < fieldCount; i++) {
+      (r.nextInt(10) < 3 ? textFields : stringFields).add("f" + i);
+    }
+    int vocabularySize = TestUtil.nextInt(r, 3, r.nextBoolean() ? 10 : 200);
+    return new TestConfig(
+        stringFields,
+        textFields,
+        vocabularySize,
+        TestUtil.nextInt(r, 1, 10),
+        0.2 + 0.8 * r.nextDouble());
   }
 
-  private static Query randomLeaf(Random r) {
-    String field = field(r);
+  private static Query randomLeaf(Random r, TestConfig config) {
+    String field = config.field(r);
     return switch (r.nextInt(12)) {
-      case 0, 1, 2, 3 -> new TermQuery(new Term(field, value(r)));
-      case 4 -> new PhraseQuery(field, value(r), value(r));
-      case 5 -> new PrefixQuery(new Term(field, value(r)));
-      case 6 -> TermRangeQuery.newStringRange(field, "b", "d", r.nextBoolean(), r.nextBoolean());
+      case 0, 1, 2, 3 -> new TermQuery(new Term(field, config.value(r)));
+      case 4 -> new PhraseQuery(field, config.value(r), config.value(r));
+      case 5 -> new PrefixQuery(new Term(field, "v" + r.nextInt(10)));
+      case 6 -> TermRangeQuery.newStringRange(field, "v1", "v5", r.nextBoolean(), r.nextBoolean());
       case 7 -> MatchAllDocsQuery.INSTANCE;
       case 8 ->
           new SynonymQuery.Builder(field)
-              .addTerm(new Term(field, value(r)))
-              .addTerm(new Term(field, value(r)))
+              .addTerm(new Term(field, config.value(r)))
+              .addTerm(new Term(field, config.value(r)))
               .build();
       case 9 ->
-          new RegexpQuery(new Term(field, r.nextBoolean() ? value(r) + ".*" : "." + value(r)));
+          new RegexpQuery(
+              new Term(field, r.nextBoolean() ? config.value(r) + ".*" : "." + config.value(r)));
       case 10 ->
           new TermInSetQuery(
               field,
               r.nextBoolean()
-                  ? List.of(new BytesRef(value(r)))
-                  : List.of(new BytesRef(value(r)), new BytesRef(value(r))));
+                  ? List.of(new BytesRef(config.value(r)))
+                  : List.of(new BytesRef(config.value(r)), new BytesRef(config.value(r))));
       default -> {
         Set<Term> terms = new TreeSet<>();
-        for (int i = 1 + r.nextInt(2); i > 0; i--) {
-          terms.add(new Term(field, value(r)));
+        for (int i = TestUtil.nextInt(r, 1, 3); i > 0; i--) {
+          terms.add(new Term(field, config.value(r)));
         }
         yield new OpaqueTermsQuery(terms);
       }
     };
   }
 
-  private static Query randomQuery(Random r, int depth) {
+  private static Query randomQuery(Random r, TestConfig config, int depth) {
     if (depth == 0 || r.nextInt(4) == 0) {
-      return randomLeaf(r);
+      return randomLeaf(r, config);
     }
     switch (r.nextInt(8)) {
       case 0:
-        return new BoostQuery(randomQuery(r, depth - 1), 2);
+        return new BoostQuery(randomQuery(r, config, depth - 1), 2);
       case 1:
-        return new ConstantScoreQuery(randomQuery(r, depth - 1));
+        return new ConstantScoreQuery(randomQuery(r, config, depth - 1));
       default:
         BooleanQuery.Builder builder = new BooleanQuery.Builder();
         int shoulds = 0;
-        for (int i = 1 + r.nextInt(4); i > 0; i--) {
+        for (int i = TestUtil.nextInt(r, 1, 5); i > 0; i--) {
           BooleanClause.Occur occur =
               BooleanClause.Occur.values()[r.nextInt(BooleanClause.Occur.values().length)];
           if (occur == BooleanClause.Occur.SHOULD) {
             shoulds++;
           }
-          builder.add(randomQuery(r, depth - 1), occur);
+          builder.add(randomQuery(r, config, depth - 1), occur);
         }
         if (shoulds > 1 && r.nextInt(5) == 0) {
-          builder.setMinimumNumberShouldMatch(1 + r.nextInt(shoulds));
+          builder.setMinimumNumberShouldMatch(TestUtil.nextInt(r, 1, shoulds));
         }
         return builder.build();
     }
   }
 
-  private static Document randomDoc(Random r) {
+  private static Document randomDocument(Random r, TestConfig config) {
     Document doc = new Document();
-    for (String field : FIELDS) {
-      if (r.nextInt(10) < 7) {
-        StringBuilder text = new StringBuilder();
-        for (int i = 1 + r.nextInt(3); i > 0; i--) {
-          text.append(value(r)).append(' ');
+    for (String field : config.allFields()) {
+      if (r.nextDouble() < config.fieldProbability()) {
+        for (int i = TestUtil.nextInt(r, 1, config.maxValues()); i > 0; i--) {
+          doc.add(randomField(r, config, field));
         }
-        doc.add(new TextField(field, text.toString(), Field.Store.NO));
       }
     }
     return doc;
+  }
+
+  private static Field randomField(Random r, TestConfig config, String field) {
+    if (config.textFields().contains(field)) {
+      StringBuilder text = new StringBuilder(config.value(r));
+      for (int i = r.nextInt(3); i > 0; i--) {
+        text.append(' ').append(config.value(r));
+      }
+      return new TextField(field, text.toString(), Field.Store.NO);
+    }
+    return new StringField(field, config.value(r), Field.Store.NO);
+  }
+
+  private static Document[] randomBatch(Random r, TestConfig config) {
+    Document[] docs = new Document[TestUtil.nextInt(r, 1, MAX_BATCH_SIZE)];
+    for (int i = 0; i < docs.length; i++) {
+      docs[i] = randomDocument(r, config);
+    }
+    return docs;
   }
 
   private static TermWeightor randomWeightor(Random r) {
@@ -147,6 +223,14 @@ public class TestNotSlotRandomized extends LuceneTestCase {
     };
   }
 
+  private static Presearcher presearcher(
+      int passes, TermWeightor weightor, List<CustomQueryHandler> handlers, int maxNotSlots) {
+    return passes == 0
+        ? new TermFilteredPresearcher(weightor, handlers, Set.of(), maxNotSlots)
+        : new MultipassTermFilteredPresearcher(
+            passes, 0, weightor, handlers, Set.of(), maxNotSlots);
+  }
+
   private static Set<String> matchIds(MultiMatchingQueries<QueryMatch> matches, int doc) {
     Set<String> ids = new HashSet<>();
     for (QueryMatch match : matches.getMatches(doc)) {
@@ -155,10 +239,32 @@ public class TestNotSlotRandomized extends LuceneTestCase {
     return ids;
   }
 
+  /** Records the ids of the queries a presearcher selects, without matching them */
+  private static Set<String> selectedIds(Monitor monitor, Document[] docs) throws IOException {
+    Set<String> ids = new HashSet<>();
+    monitor.match(
+        docs,
+        searcher ->
+            new CandidateMatcher<>(searcher) {
+              @Override
+              public void matchQuery(String queryId, Query matchQuery, Map<String, String> md) {
+                ids.add(queryId);
+              }
+
+              @Override
+              public QueryMatch resolve(QueryMatch match1, QueryMatch match2) {
+                return match1;
+              }
+            });
+    return ids;
+  }
+
   public void testNotSlotsNeverDropMatches() throws IOException {
     Random r = random();
+    long excluded = 0;
     for (int iteration = atLeast(5); iteration > 0; iteration--) {
-      int maxNotSlots = 1 + r.nextInt(2);
+      TestConfig config = randomTestConfig(r);
+      int maxNotSlots = TestUtil.nextInt(r, 1, 2);
       TermWeightor weightor = randomWeightor(r);
       List<CustomQueryHandler> handlers = new ArrayList<>();
       if (r.nextBoolean()) {
@@ -166,28 +272,31 @@ public class TestNotSlotRandomized extends LuceneTestCase {
       }
       handlers.add(new OpaqueTermsQuery.Handler(r.nextBoolean()));
       int passes = r.nextInt(7);
-      Presearcher presearcher =
-          passes == 0
-              ? new TermFilteredPresearcher(weightor, handlers, Set.of(), maxNotSlots)
-              : new MultipassTermFilteredPresearcher(
-                  passes, 0, weightor, handlers, Set.of(), maxNotSlots);
-      String config =
-          "passes=" + passes + " maxNotSlots=" + maxNotSlots + " handlers=" + handlers.size();
+      String description =
+          "passes="
+              + passes
+              + " maxNotSlots="
+              + maxNotSlots
+              + " handlers="
+              + handlers.size()
+              + " "
+              + config;
 
       try (Monitor oracle = new Monitor(ANALYZER, Presearcher.NO_FILTERING);
-          Monitor monitor = new Monitor(ANALYZER, presearcher)) {
+          Monitor withoutNotSlots =
+              new Monitor(ANALYZER, presearcher(passes, weightor, handlers, 0));
+          Monitor monitor =
+              new Monitor(ANALYZER, presearcher(passes, weightor, handlers, maxNotSlots))) {
         List<MonitorQuery> queries = new ArrayList<>();
-        for (int i = 0; i < 100; i++) {
-          queries.add(new MonitorQuery(Integer.toString(i), randomQuery(r, 3)));
+        for (int i = 0; i < 150; i++) {
+          queries.add(new MonitorQuery(Integer.toString(i), randomQuery(r, config, 3)));
         }
         oracle.register(queries);
+        withoutNotSlots.register(queries);
         monitor.register(queries);
 
         for (int batch = 0; batch < 20; batch++) {
-          Document[] docs = new Document[1 + r.nextInt(4)];
-          for (int i = 0; i < docs.length; i++) {
-            docs[i] = randomDoc(r);
-          }
+          Document[] docs = randomBatch(r, config);
           MultiMatchingQueries<QueryMatch> expected = oracle.match(docs, QueryMatch.SIMPLE_MATCHER);
           MultiMatchingQueries<QueryMatch> actual = monitor.match(docs, QueryMatch.SIMPLE_MATCHER);
           for (int i = 0; i < docs.length; i++) {
@@ -195,58 +304,23 @@ public class TestNotSlotRandomized extends LuceneTestCase {
             missing.removeAll(matchIds(actual, i));
             if (!missing.isEmpty()) {
               StringBuilder message =
-                  new StringBuilder(config + ": dropped matches for " + docs[i] + "\n");
+                  new StringBuilder(description + ": dropped matches for " + docs[i] + "\n");
               for (String id : missing) {
                 message
                     .append(id)
                     .append(": ")
-                    .append(queries.get(Integer.parseInt(id)).getQuery());
-                message.append('\n');
+                    .append(queries.get(Integer.parseInt(id)).getQuery())
+                    .append('\n');
               }
               fail(message.toString());
             }
           }
+          Set<String> exclusions = selectedIds(withoutNotSlots, docs);
+          exclusions.removeAll(selectedIds(monitor, docs));
+          excluded += exclusions.size();
         }
       }
     }
-  }
-
-  public void testZeroNotSlotsSelectsLikeTheExistingConstructors() throws IOException {
-    Random r = random();
-    int passes = 1 + r.nextInt(6);
-    TermWeightor weightor = randomWeightor(r);
-    List<CustomQueryHandler> handlers = List.of(new RegexpQueryHandler());
-    try (Monitor existing =
-            new Monitor(
-                ANALYZER,
-                new MultipassTermFilteredPresearcher(passes, 0, weightor, handlers, Set.of()));
-        Monitor zero =
-            new Monitor(
-                ANALYZER,
-                new MultipassTermFilteredPresearcher(passes, 0, weightor, handlers, Set.of(), 0));
-        Monitor existingSingle =
-            new Monitor(ANALYZER, new TermFilteredPresearcher(weightor, handlers, Set.of()));
-        Monitor zeroSingle =
-            new Monitor(ANALYZER, new TermFilteredPresearcher(weightor, handlers, Set.of(), 0))) {
-      List<MonitorQuery> queries = new ArrayList<>();
-      for (int i = 0; i < 100; i++) {
-        queries.add(new MonitorQuery(Integer.toString(i), randomQuery(r, 3)));
-      }
-      for (Monitor m : List.of(existing, zero, existingSingle, zeroSingle)) {
-        m.register(queries);
-      }
-      for (int batch = 0; batch < 20; batch++) {
-        Document[] docs = new Document[1 + r.nextInt(4)];
-        for (int i = 0; i < docs.length; i++) {
-          docs[i] = randomDoc(r);
-        }
-        assertEquals(
-            existing.match(docs, QueryMatch.SIMPLE_MATCHER).getQueriesRun(),
-            zero.match(docs, QueryMatch.SIMPLE_MATCHER).getQueriesRun());
-        assertEquals(
-            existingSingle.match(docs, QueryMatch.SIMPLE_MATCHER).getQueriesRun(),
-            zeroSingle.match(docs, QueryMatch.SIMPLE_MATCHER).getQueriesRun());
-      }
-    }
+    assertTrue("NotSlots never excluded a query", excluded > 0);
   }
 }

@@ -68,4 +68,16 @@ public class TestNotSlotTermPresearcher extends NotSlotPresearcherTestBase {
         IllegalArgumentException.class,
         () -> new TermFilteredPresearcher(TermWeightor.DEFAULT, List.of(), Set.of(), -1));
   }
+
+  public void testNotSlotFieldNamesAreGuarded() {
+    // Positive terms on fields containing NOT_SUFFIX select their query for every document, so
+    // that a user field can never be indexed under a NotSlot field's name (whose clauses exclude).
+    // Every NotSlot field name must therefore contain NOT_SUFFIX.
+    for (String field : new String[] {"x", "x_0", "x__not", "__notslot"}) {
+      for (int slot = 0; slot < 12; slot++) {
+        String name = TermFilteredPresearcher.notSlotField(field, slot);
+        assertTrue(name, name.contains(TermFilteredPresearcher.NOT_SUFFIX));
+      }
+    }
+  }
 }
