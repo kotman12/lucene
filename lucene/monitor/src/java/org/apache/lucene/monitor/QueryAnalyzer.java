@@ -22,7 +22,6 @@ import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.function.BiFunction;
 import java.util.function.Function;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
@@ -41,8 +40,7 @@ import org.apache.lucene.search.TermQuery;
  */
 class QueryAnalyzer {
 
-  private final BiFunction<Query, TermWeightor, QueryTree> unknownQueryMapper;
-  private final BiFunction<Query, TermWeightor, QueryTree> negatedQueryMapper;
+  private final List<CustomQueryHandler> handlers;
   private final boolean isNegationOptimized;
 
   QueryAnalyzer(List<CustomQueryHandler> queryTreeBuilders) {
@@ -53,29 +51,26 @@ class QueryAnalyzer {
    * @param isNegationOptimized whether negated clauses become NotSlots, rather than being ignored
    */
   QueryAnalyzer(List<CustomQueryHandler> queryTreeBuilders, boolean isNegationOptimized) {
-    this.unknownQueryMapper = buildMapper(queryTreeBuilders, h -> h::handleQuery);
-    this.negatedQueryMapper = buildMapper(queryTreeBuilders, h -> h::handleNegatedQuery);
+    this.handlers = queryTreeBuilders;
     this.isNegationOptimized = isNegationOptimized;
   }
 
   QueryAnalyzer() {
-    this.unknownQueryMapper = (_, _) -> null;
-    this.negatedQueryMapper = (_, _) -> null;
-    this.isNegationOptimized = false;
+    this(List.of(), false);
   }
 
-  private static BiFunction<Query, TermWeightor, QueryTree> buildMapper(
-      List<CustomQueryHandler> mappers,
-      Function<CustomQueryHandler, BiFunction<Query, TermWeightor, QueryTree>> method) {
-    return (q, w) -> {
-      for (CustomQueryHandler mapper : mappers) {
-        QueryTree qt = method.apply(mapper).apply(q, w);
-        if (qt != null) {
-          return qt;
-        }
+  /** The first non-null tree the custom handlers build for {@code query}, or null */
+  private QueryTree handle(Query query, TermWeightor weightor, boolean negated) {
+    for (CustomQueryHandler handler : handlers) {
+      QueryTree tree =
+          negated
+              ? handler.handleNegatedQuery(query, weightor)
+              : handler.handleQuery(query, weightor);
+      if (tree != null) {
+        return tree;
       }
-      return null;
-    };
+    }
+    return null;
   }
 
   /**
@@ -169,22 +164,13 @@ class QueryAnalyzer {
 
     @Override
     public void visitLeaf(Query query) {
-      if (isNegativeClause) {
-        children.add(
-            w -> {
-              QueryTree q = negatedQueryMapper.apply(query, w);
-              if (q == null) {
-                return QueryTree.anyTerm("NOT " + query);
-              }
-              return q;
-            });
-        return;
-      }
+      // Under negation only handleNegatedQuery is used: a handler's positive tree may select more
+      // documents than the query matches, so negating it would be unsound
       children.add(
           w -> {
-            QueryTree q = unknownQueryMapper.apply(query, w);
+            QueryTree q = handle(query, w, isNegativeClause);
             if (q == null) {
-              return QueryTree.anyTerm(query.toString());
+              return QueryTree.anyTerm(isNegativeClause ? "NOT " + query : query.toString());
             }
             return q;
           });

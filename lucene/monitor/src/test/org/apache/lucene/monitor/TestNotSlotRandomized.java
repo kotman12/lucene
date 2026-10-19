@@ -24,7 +24,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
-import java.util.TreeSet;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.document.Document;
@@ -145,11 +144,11 @@ public class TestNotSlotRandomized extends LuceneTestCase {
                   ? List.of(new BytesRef(config.value(r)))
                   : List.of(new BytesRef(config.value(r)), new BytesRef(config.value(r))));
       default -> {
-        Set<Term> terms = new TreeSet<>();
-        for (int i = TestUtil.nextInt(r, 1, 3); i > 0; i--) {
-          terms.add(new Term(field, config.value(r)));
+        List<BytesRef> terms = new ArrayList<>();
+        for (int i = TestUtil.nextInt(r, 2, 3); i > 0; i--) {
+          terms.add(new BytesRef(config.value(r)));
         }
-        yield new OpaqueTermsQuery(terms);
+        yield new TermInSetQuery(field, terms);
       }
     };
   }
@@ -270,7 +269,7 @@ public class TestNotSlotRandomized extends LuceneTestCase {
       if (r.nextBoolean()) {
         handlers.add(new RegexpQueryHandler());
       }
-      handlers.add(new OpaqueTermsQuery.Handler(r.nextBoolean()));
+      handlers.add(new TermInSetQueryHandler(r.nextBoolean()));
       int passes = r.nextInt(7);
       String description =
           "passes="

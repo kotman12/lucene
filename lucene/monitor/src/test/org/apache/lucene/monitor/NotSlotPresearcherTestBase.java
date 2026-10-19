@@ -40,6 +40,7 @@ import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.ByteRunnable;
 
 /** Presearcher tests with NotSlots enabled, in addition to all of {@link PresearcherTestBase} */
@@ -157,14 +158,14 @@ public abstract class NotSlotPresearcherTestBase extends PresearcherTestBase {
         new BooleanQuery.Builder()
             .add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
             .add(
-                new OpaqueTermsQuery(Set.of(new Term("f", "x"), new Term("f", "y"))),
+                new TermInSetQuery("f", List.of(new BytesRef("x"), new BytesRef("y"))),
                 BooleanClause.Occur.MUST_NOT)
             .build();
-    Presearcher negatable = createPresearcher(1, List.of(new OpaqueTermsQuery.Handler(true)));
+    Presearcher negatable = createPresearcher(1, List.of(new TermInSetQueryHandler(true)));
     assertRunAndMatched(0, 0, run(negatable, query, doc("f", "y")));
     assertRunAndMatched(1, 1, run(negatable, query, doc("f", "z")));
 
-    Presearcher notNegatable = createPresearcher(1, List.of(new OpaqueTermsQuery.Handler(false)));
+    Presearcher notNegatable = createPresearcher(1, List.of(new TermInSetQueryHandler(false)));
     assertRunAndMatched(1, 0, run(notNegatable, query, doc("f", "y")));
   }
 

@@ -29,6 +29,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.BytesRef;
@@ -312,18 +313,19 @@ public class TestQueryAnalyzer extends LuceneTestCase {
     Query query =
         new BooleanQuery.Builder()
             .add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
-            .add(new OpaqueTermsQuery(Set.of(t("x"), t("y"))), BooleanClause.Occur.MUST_NOT)
+            .add(
+                new TermInSetQuery("field", List.of(new BytesRef("x"), new BytesRef("y"))),
+                BooleanClause.Occur.MUST_NOT)
             .build();
 
     // the handler's positive tree is never negated
-    QueryAnalyzer notNegatable =
-        new QueryAnalyzer(List.of(new OpaqueTermsQuery.Handler(false)), true);
+    QueryAnalyzer notNegatable = new QueryAnalyzer(List.of(new TermInSetQueryHandler(false)), true);
     assertEquals(
         new Pass(ANY, List.of()), collect(notNegatable.buildTree(query, TermWeightor.DEFAULT)));
 
     QueryAnalyzer negatable =
         new QueryAnalyzer(
-            List.of(new OpaqueTermsQuery.Handler(false), new OpaqueTermsQuery.Handler(true)), true);
+            List.of(new TermInSetQueryHandler(false), new TermInSetQueryHandler(true)), true);
     assertEquals(
         new Pass(Set.of(), List.of(Set.of(t("x"), t("y")))),
         collect(negatable.buildTree(query, TermWeightor.DEFAULT)));
